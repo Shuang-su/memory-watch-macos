@@ -1,6 +1,6 @@
 # 1.2.0 完成记录
 
-状态：核心实现、本机安装和测试已验证；界面复核及 GitHub PR/CI/Release 仍在进行，待完成项不能视为通过或已交付。
+状态：实现、本机安装和测试已验证，PR 初轮 CI 通过；菜单视觉/交互未能经电脑工具核验。正式发布、最终重装和压缩包校验值以 [Issue #1](https://github.com/Shuang-su/memory-watch-macos/issues/1) 的交付记录为准。
 
 ## 已核查的现场证据
 
@@ -17,6 +17,7 @@
 
 - 五类系统预览进程自动保护，footprint 阈值按物理内存连续线性设置，迁移旧版开关时保留已关闭选择。
 - VSZ 增长阈值独立线性设置为 8–80 GiB；连续系统压力和 60 秒内 swap 增长提醒保持只提醒。Python CLI 保持只提醒并兼容本机 Python 3.9.6。
+- 顶栏状态项增加辅助功能标签，重新打开已运行的无窗口 App 时显示菜单。
 - 文档已补充现场证据、指标解释、计划和兼容边界。
 
 ## 验证与部署
@@ -24,12 +25,13 @@
 - 原生 App 本机构建成功，三组原生自测通过。
 - Python 回归 23 项测试在实际 Python 3.9.6 环境全部通过；安装器 7 项隔离故障测试通过。
 - 1.2.0 / build 3 已安装到 `~/Applications/Memory Watch.app`，安装位置的 `codesign --verify --strict` 通过。
-- 当前用户 LaunchAgent 的 `RunAtLoad` 为 true，使用 `/usr/bin/open` 启动 App，最近退出状态为 0；安装后已核对准确安装路径对应的 App 进程运行（初次核对 PID 13106，重装后 PID 可变化）。
+- 最新重新安装后已核对 1.2.0 / build 3 的准确安装路径对应进程运行（本次 PID 15059，CPU 约 0%、RSS 约 77 MiB；PID 与占用会变化）。当前用户 LaunchAgent 的 `RunAtLoad` 为 true，使用 `/usr/bin/open` 启动 App，最近退出状态为 0；没有将配置验证表述为已完成退出登录后的实测。
 - 2026-11-02 16:12:41（Asia/Shanghai；08:12:41Z），现场自动保护日志记录向真实 `HydraRenderingService` PID 60749 发送 SIGKILL：footprint 23.867999 GiB，阈值 20 GiB，`errno=0`。500 ms 退出检查结果为 `unconfirmed`，日志没有把信号成功等同于已退出；后续 `ps` 和独立 CLI 检查均确认原 PID 60749 已消失。
 - 通知最初被系统关闭；通过系统设置开启“内存提醒”通知后，`--test-notification` 返回 `authorized=true delivered=true`，退出码为 0。
-- GitHub 跟踪 [Issue #1](https://github.com/Shuang-su/memory-watch-macos/issues/1) 已创建。
-- 待完成：无窗口 App 的菜单/辅助功能界面复核和最终重新安装后的状态确认。
-- 待完成：GitHub PR、CI、合并提交、Release、最终压缩包校验值。
+- 电脑工具反复获取无窗口 App 时超时，菜单视觉/交互未能经电脑工具核验；不将辅助功能标签、重新打开显示菜单的实现或进程运行验证等同于菜单视觉/交互通过。
+- GitHub 跟踪 [Issue #1](https://github.com/Shuang-su/memory-watch-macos/issues/1) 和 [PR #2](https://github.com/Shuang-su/memory-watch-macos/pull/2) 已创建。
+- PR 实现提交 `a5ee7c521ffa42c19021a86d22d6d578560e7cd6` 的[初轮 CI](https://github.com/Shuang-su/memory-watch-macos/actions/runs/41412186920) 已完成并成功；后续文档提交后的最终 CI 以 PR 检查结果为准。
+- 正式发布、合并提交、最终重装结果和最终压缩包校验值见 Issue #1 的交付记录；本记录不预先断言 Release 已存在。
 
 ## 边界
 
