@@ -17,8 +17,8 @@ cat > "$task_app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>内存提醒</string>
 <key>CFBundleExecutable</key><string>MemoryWatch</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.0</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleShortVersionString</key><string>1.2.0</string>
+<key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
@@ -35,4 +35,6 @@ task_signed_app="$task_sign_dir/Memory Watch.app"
 /usr/bin/codesign --verify --strict "$task_signed_app"
 "$task_signed_app/Contents/MacOS/MemoryWatch" --self-test
 /usr/bin/ditto -c -k --norsrc --noextattr --keepParent "$task_signed_app" "$task_output/Memory Watch.zip"
+(cd "$task_output" && /usr/bin/shasum -a 256 'Memory Watch.zip' > 'Memory Watch.zip.sha256')
 print -r -- "$task_output/Memory Watch.zip"
+print -r -- "$task_output/Memory Watch.zip.sha256"

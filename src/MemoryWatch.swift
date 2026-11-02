@@ -4,6 +4,7 @@ import Darwin
 
 let GiB = Double(1 << 30)
 let appID = "local.shuangsu.memory-watch"
+let appVersion = "1.2.0"
 let supportURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Logs/Memory Watch", isDirectory: true)
 
@@ -13,8 +14,30 @@ struct Reading {
     let name: String
     let bytes: UInt64
     var executablePath: String = ""
+    var residentBytes: UInt64? = nil
+    var virtualBytes: UInt64? = nil
     var gib: Double { Double(bytes) / GiB }
     var key: String { "\(pid):\(birth)" }
+}
+
+struct Thresholds {
+    let ramGiB: Double
+    init(ramGiB: Double = Double(ProcessInfo.processInfo.physicalMemory) / GiB) { self.ramGiB = ramGiB }
+    var limit: Double { min(20, max(4, 4 + (ramGiB - 16) * 16 / 496)) }
+    var virtualGrowth: Double { min(80, max(8, 8 + (ramGiB - 16) * 72 / 496)) }
+    var limitBytes: UInt64 { UInt64(ceil(limit * GiB)) }
+}
+
+func gibText(_ bytes: UInt64?) -> String {
+    bytes.map { String(format: "%.2f GiB", Double($0) / GiB) } ?? "不可用"
+}
+
+func migratedProtectionPreference(_ defaults: UserDefaults = .standard) -> Bool {
+    if defaults.object(forKey: "autoExitPreview") == nil {
+        let enabled = defaults.object(forKey: "autoExitSceneKit") == nil ? true : defaults.bool(forKey: "autoExitSceneKit")
+        defaults.set(enabled, forKey: "autoExitPreview")
+    }
+    return defaults.bool(forKey: "autoExitPreview")
 }
 
 func readUsage(_ pid: Int32) -> rusage_info_v0? {
@@ -33,8 +56,17 @@ func readProcess(_ pid: Int32) -> Reading? {
     let length = path.withUnsafeMutableBytes { proc_pidpath(pid, $0.baseAddress, UInt32($0.count)) }
     let executable = length > 0 ? String(cString: path) : ""
     let name = executable.isEmpty ? "PID \(pid)" : (executable as NSString).lastPathComponent
+    var task = proc_taskinfo()
+    let taskSize = MemoryLayout<proc_taskinfo>.size
+    let taskCount = withUnsafeMutablePointer(to: &task) {
+        proc_pidinfo(pid, PROC_PIDTASKINFO, 0, $0, Int32(taskSize))
+    }
+    // Bind the extra metrics to the same process instance, even if a PID was reused during sampling.
+    guard let after = readUsage(pid), after.ri_proc_start_abstime == usage.ri_proc_start_abstime else { return nil }
     return Reading(pid: pid, birth: usage.ri_proc_start_abstime, name: name,
-                   bytes: usage.ri_phys_footprint, executablePath: executable)
+                   bytes: after.ri_phys_footprint, executablePath: executable,
+                   residentBytes: after.ri_resident_size,
+                   virtualBytes: taskCount == Int32(taskSize) ? task.pti_virtual_size : nil)
 }
 
 func snapshot() -> (items: [Reading], skipped: Int) {
@@ -74,25 +106,36 @@ func processHasExited(_ expected: Reading) -> Bool {
 
 struct AutoExitAttempt {
     let reading: Reading
+    let threshold: UInt64
     let error: Int32?
 }
 
-final class SceneKitProtection {
+final class PreviewProtection {
     static let name = "SceneKitQLThumbnailExtension"
     static let path = "/System/Library/Frameworks/SceneKit.framework/PlugIns/SceneKitQLThumbnailExtension.appex/Contents/MacOS/SceneKitQLThumbnailExtension"
-    static let limit: UInt64 = 4 * (1 << 30)
+    static let paths: [String: String] = [
+        name: path,
+        "SceneKitQLPreviewExtension": "/System/Library/Frameworks/SceneKit.framework/PlugIns/SceneKitQLPreviewExtension.appex/Contents/MacOS/SceneKitQLPreviewExtension",
+        "HydraQLThumbnailExtension": "/System/Library/PrivateFrameworks/Hydra.framework/Plugins/HydraQLThumbnailExtension.appex/Contents/MacOS/HydraQLThumbnailExtension",
+        "HydraQLPreviewExtension": "/System/Library/PrivateFrameworks/Hydra.framework/Plugins/HydraQLPreviewExtension.appex/Contents/MacOS/HydraQLPreviewExtension",
+        "HydraRenderingService": "/System/Library/PrivateFrameworks/Hydra.framework/Versions/C/XPCServices/HydraRenderingService.xpc/Contents/MacOS/HydraRenderingService"
+    ]
+    let limit: UInt64
+    init(limit: UInt64 = Thresholds().limitBytes) { self.limit = limit }
     private var attempts: [String: Double] = [:]
 
+    static func isPreview(_ reading: Reading) -> Bool {
+        reading.pid > 1 && reading.pid != getpid() && paths[reading.name] == reading.executablePath
+    }
     private func matches(_ reading: Reading) -> Bool {
-        reading.pid > 1 && reading.pid != getpid() && reading.name == Self.name
-            && reading.executablePath == Self.path && reading.bytes >= Self.limit
+        Self.isPreview(reading) && reading.bytes >= limit
     }
 
     func enforce(_ items: [Reading], now: Double, enabled: Bool,
                  probe: (Int32) -> CheckedProcess? = checkedProcess,
                  signal: (Int32, Int32) -> Int32 = Darwin.kill) -> [AutoExitAttempt] {
         let live = Set(items.map { $0.key })
-        attempts = attempts.filter { live.contains($0.key) }
+        attempts = attempts.filter { live.contains($0.key) || now - $0.value < 60 }
         guard enabled else { return [] }
         var results: [AutoExitAttempt] = []
         for candidate in items where matches(candidate) {
@@ -100,10 +143,11 @@ final class SceneKitProtection {
             // Re-read identity, ownership and footprint immediately before the signal.
             guard let current = probe(candidate.pid), current.owner == getuid(),
                   current.reading.pid == candidate.pid, current.reading.birth == candidate.birth,
+                  current.reading.executablePath == candidate.executablePath,
                   matches(current.reading) else { continue }
             attempts[candidate.key] = now
             let result = signal(current.reading.pid, SIGKILL)
-            results.append(AutoExitAttempt(reading: current.reading, error: result == 0 ? nil : errno))
+            results.append(AutoExitAttempt(reading: current.reading, threshold: limit, error: result == 0 ? nil : errno))
         }
         return results
     }
@@ -142,9 +186,9 @@ final class Detector {
             var level = 0
             var reason = ""
             if item.gib >= critical {
-                level = 3; reason = "达到严重阈值 \(Int(critical)) GiB，请检查活动监视器。"
+                level = 3; reason = String(format: "内存足迹达到严重阈值 %.2f GiB，请检查活动监视器。", critical)
             } else if track.highSamples >= 2 {
-                level = 2; reason = "连续两次超过 \(Int(warn)) GiB。"
+                level = 2; reason = String(format: "内存足迹连续两次达到 %.2f GiB。", warn)
             } else if item.gib >= 1 && elapsed >= 10 && growth >= 0.5 {
                 level = 1; reason = String(format: "%.0f 秒内增长 %.0f MiB。", elapsed, growth * 1024)
             }
@@ -157,6 +201,104 @@ final class Detector {
         }
         tracks = next
         return alerts.sorted { $0.level == $1.level ? $0.reading.bytes > $1.reading.bytes : $0.level > $1.level }
+    }
+}
+
+struct VirtualTrack {
+    var baseline: UInt64?
+    var lastAlert = -Double.infinity
+}
+
+final class VirtualDetector {
+    let threshold: Double
+    var tracks: [String: VirtualTrack] = [:]
+    var hasProblem = false
+    init(threshold: Double = Thresholds().virtualGrowth) { self.threshold = threshold }
+    func reset() { tracks.removeAll(); hasProblem = false }
+    func update(_ items: [Reading], now: Double) -> [Alert] {
+        hasProblem = false
+        var next: [String: VirtualTrack] = [:]
+        var alerts: [Alert] = []
+        for item in items where PreviewProtection.isPreview(item) {
+            var track = tracks[item.key] ?? VirtualTrack()
+            if let value = item.virtualBytes {
+                if track.baseline == nil { track.baseline = value }
+                let baseline = track.baseline!
+                let growth = value >= baseline ? Double(value - baseline) / GiB : 0
+                if growth >= threshold {
+                    hasProblem = true
+                    if now - track.lastAlert >= 300 {
+                        let reason = String(format: "虚拟空间较首次采样增长 %.2f GiB（提醒线 %.2f GiB）；仅提醒，地址保留不等于 RAM 或 Swap。", growth, threshold)
+                        alerts.append(Alert(reading: item, level: 1, reason: reason))
+                        track.lastAlert = now
+                    }
+                }
+            }
+            next[item.key] = track
+        }
+        tracks = next
+        return alerts
+    }
+}
+
+struct SystemReading {
+    var swapBytes: UInt64?
+    var pressure: UInt32?
+    var pressureText: String {
+        switch pressure {
+        case 1: return "正常"
+        case 2: return "警告"
+        case 4: return "严重"
+        default: return "不可用"
+        }
+    }
+}
+
+func systemSnapshot() -> SystemReading {
+    var swap = xsw_usage()
+    var swapSize = MemoryLayout<xsw_usage>.size
+    let swapOK = sysctlbyname("vm.swapusage", &swap, &swapSize, nil, 0) == 0 && swapSize == MemoryLayout<xsw_usage>.size
+    var pressure: UInt32 = 0
+    var pressureSize = MemoryLayout<UInt32>.size
+    let pressureOK = sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &pressureSize, nil, 0) == 0 && pressureSize == MemoryLayout<UInt32>.size
+    return SystemReading(swapBytes: swapOK ? swap.xsu_used : nil, pressure: pressureOK ? pressure : nil)
+}
+
+final class SystemDetector {
+    var history: [(Double, UInt64)] = []
+    var abnormalSamples = 0
+    var lastPressureAlert = -Double.infinity
+    var lastPressureLevel = 0
+    var lastSwapAlert = -Double.infinity
+    var swapGrowth: Double? = nil
+    var hasProblem = false
+    func update(_ reading: SystemReading, now: Double) -> String? {
+        if let previous = history.last, now - previous.0 > 60 { history.removeAll() }
+        while history.count > 1 && history[1].0 <= now - 60 { history.removeFirst() }
+        swapGrowth = nil
+        if let swap = reading.swapBytes {
+            history.append((now, swap))
+            if let first = history.first, now - first.0 >= 60 {
+                swapGrowth = max(0, (Double(swap) - Double(first.1)) / GiB)
+            }
+        } else { history.removeAll() }
+        let abnormal = reading.pressure == 2 || reading.pressure == 4
+        abnormalSamples = abnormal ? abnormalSamples + 1 : 0
+        let pressureProblem = abnormalSamples >= 2
+        let swapProblem = (swapGrowth ?? 0) >= 1
+        let pressureLevel = reading.pressure == 4 ? 3 : 2
+        hasProblem = pressureProblem || swapProblem
+        var reasons: [String] = []
+        if pressureProblem && (now - lastPressureAlert >= 300 || pressureLevel > lastPressureLevel) {
+            reasons.append("内存压力连续两轮\(reading.pressureText)")
+            lastPressureAlert = now; lastPressureLevel = pressureLevel
+        }
+        if swapProblem && now - lastSwapAlert >= 300 {
+            reasons.append(String(format: "约 60 秒窗口内 Swap 净增 %.2f GiB", swapGrowth!))
+            lastSwapAlert = now
+        }
+        guard !reasons.isEmpty else { return nil }
+        return "系统内存：\(reasons.joined(separator: "；"))。Swap 当前 \(gibText(reading.swapBytes))；系统数据不能归因到单个进程。"
     }
 }
 
@@ -186,19 +328,23 @@ func logEvent(_ message: String) {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var status: NSStatusItem!
     var timer: Timer?
+    let thresholds = Thresholds()
     let detector = Detector()
-    let sceneKitProtection = SceneKitProtection()
+    let previewProtection = PreviewProtection()
+    let virtualDetector = VirtualDetector()
+    var systemDetector = SystemDetector()
+    var systemReading = SystemReading()
     let worker = DispatchQueue(label: "memory-watch.sampling", qos: .utility)
     var busy = false
     var paused = false
+    var samplingEpoch = 0
     var readings: [Reading] = []
     var skipped = 0
     var sampled = false
     var latest = "尚无告警"
     var notificationState = "正在检查通知权限…"
     var relaxed = UserDefaults.standard.bool(forKey: "relaxed")
-    var autoExitSceneKit = UserDefaults.standard.object(forKey: "autoExitSceneKit") == nil
-        ? true : UserDefaults.standard.bool(forKey: "autoExitSceneKit")
+    var autoExitPreview = migratedProtectionPreference()
     var agentURL: URL { FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/\(appID).plist") }
 
@@ -208,6 +354,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         setStatusIcon(problem: false)
         status.button?.imagePosition = .imageOnly
         status.button?.title = ""
+        status.button?.setAccessibilityLabel("内存提醒")
+        status.button?.setAccessibilityIdentifier("\(appID).status")
         let menu = NSMenu(); menu.delegate = self; status.menu = menu
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { allowed, error in
@@ -216,43 +364,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 logEvent("notificationAuthorization allowed=\(allowed) error=\(error?.localizedDescription ?? "none")")
             }
         }
-        logEvent("started version=1.1.0 interval=5s sceneKitAutoExit=\(autoExitSceneKit) thresholdGiB=4 otherProcessesAlertsOnly=true")
+        logEvent("started version=\(appVersion) interval=5s ramGiB=\(thresholds.ramGiB) previewAutoExit=\(autoExitPreview) thresholdGiB=\(thresholds.limit) virtualGrowthGiB=\(thresholds.virtualGrowth) otherProcessesAlertsOnly=true")
         applyThresholds()
         tick()
         timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // Reopening a menu-bar app should expose its controls even if its icon is hidden by other extras.
+        status.button?.performClick(nil)
+        return true
+    }
+
     func tick() {
         guard !busy && !paused else { return }
         busy = true
+        let epoch = samplingEpoch
         worker.async {
             let result = snapshot()
+            let system = systemSnapshot()
             DispatchQueue.main.async {
                 self.busy = false
-                guard !self.paused else { return }
+                guard !self.paused && epoch == self.samplingEpoch else { return }
                 self.readings = result.items; self.skipped = result.skipped
+                self.systemReading = system
                 if !self.sampled {
                     logEvent("firstSample readable=\(result.items.count) unavailable=\(result.skipped)")
                     self.sampled = true
                 }
-                guard !result.items.isEmpty else {
-                    self.setStatusIcon(problem: true)
-                    self.status.button?.toolTip = "未能读取进程；下一轮会重试。"
-                    return
-                }
                 let now = ProcessInfo.processInfo.systemUptime
-                let actions = self.sceneKitProtection.enforce(result.items, now: now, enabled: self.autoExitSceneKit)
+                let actions = self.previewProtection.enforce(result.items, now: now, enabled: self.autoExitPreview)
                 let handled = Set(actions.map { $0.reading.key })
-                let alerts = self.detector.update(result.items, now: now).filter { !handled.contains($0.reading.key) }
-                let highest = result.items.first!
-                self.setStatusIcon(problem: self.detector.hasProblem || !actions.isEmpty)
-                self.status.button?.toolTip = String(format: "最高：%@ · %.2f GiB\n每 5 秒检查，点击查看进程。", highest.name, highest.gib)
-                if !alerts.isEmpty {
+                let alerts = (self.detector.update(result.items, now: now)
+                    + self.virtualDetector.update(result.items, now: now)).filter { !handled.contains($0.reading.key) }
+                let systemAlert = self.systemDetector.update(system, now: now)
+                self.setStatusIcon(problem: result.items.isEmpty || self.detector.hasProblem || self.virtualDetector.hasProblem || self.systemDetector.hasProblem || !actions.isEmpty)
+                if let highest = result.items.first {
+                    self.status.button?.toolTip = String(format: "最高内存足迹：%@ · %.2f GiB\nSwap %@ · 内存压力 %@", highest.name, highest.gib, gibText(system.swapBytes), system.pressureText)
+                } else {
+                    self.status.button?.toolTip = "未能读取进程；下一轮会重试。\nSwap \(gibText(system.swapBytes)) · 压力\(system.pressureText)"
+                }
+                if !alerts.isEmpty || systemAlert != nil {
                     for alert in alerts { logEvent("ALERT level=\(alert.level) \(alert.text)") }
-                    self.latest = alerts[0].text
-                    var text = alerts.prefix(2).map { $0.text }.joined(separator: "\n")
-                    if alerts.count > 2 { text += "\n另有 \(alerts.count - 2) 个进程，详情见日志。" }
+                    if let systemAlert { logEvent("SYSTEM_ALERT \(systemAlert)") }
+                    let messages = alerts.map { $0.text } + (systemAlert.map { [$0] } ?? [])
+                    self.latest = messages[0]
+                    var text = messages.prefix(2).joined(separator: "\n")
+                    if messages.count > 2 { text += "\n另有 \(messages.count - 2) 项，详情见日志。" }
                     self.sendNotification(text)
                 }
                 self.reportAutoExits(actions)
@@ -263,7 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func reportAutoExits(_ actions: [AutoExitAttempt]) {
         guard !actions.isEmpty else { return }
         for action in actions {
-            logEvent("AUTO_EXIT_ATTEMPT pid=\(action.reading.pid) footprintGiB=\(action.reading.gib) signal=SIGKILL errno=\(action.error ?? 0)")
+            logEvent("AUTO_EXIT_ATTEMPT name=\(action.reading.name) pid=\(action.reading.pid) birth=\(action.reading.birth) footprintGiB=\(action.reading.gib) rss=\(gibText(action.reading.residentBytes)) vsz=\(gibText(action.reading.virtualBytes)) thresholdGiB=\(Double(action.threshold) / GiB) reason=footprint signal=SIGKILL errno=\(action.error ?? 0)")
         }
         // Check after the OS has had time to reap the process; do not block the UI.
         worker.asyncAfter(deadline: .now() + 0.5) {
@@ -274,7 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     return "自动强制退出失败（errno \(error)）：\(detail)"
                 }
                 return processHasExited(action.reading)
-                    ? "已自动强制退出：\(detail)（阈值 4 GiB）"
+                    ? String(format: "已自动强制退出：%@（内存足迹阈值 %.2f GiB）", detail, Double(action.threshold) / GiB)
                     : "已发送强制退出信号，尚未确认退出：\(detail)"
             }
             DispatchQueue.main.async {
@@ -332,14 +491,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(.separator())
         for reading in readings.prefix(7) {
             let row = item(menu, String(format: "%.2f GiB  %@  [PID %d]", reading.gib, reading.name, reading.pid), #selector(openActivityMonitor))
-            row.toolTip = "打开活动监视器，可按 PID 查找此进程。"
+            row.toolTip = "内存足迹 \(gibText(reading.bytes)) · RSS \(gibText(reading.residentBytes)) · 虚拟空间 \(gibText(reading.virtualBytes))。点击打开活动监视器。"
         }
         menu.addItem(.separator())
         _ = item(menu, "最近告警：\(latest.replacingOccurrences(of: "\n", with: " · "))")
-        _ = item(menu, "\(Int(detector.warn))/\(Int(detector.critical)) GiB 告警 · 60 秒内增长 512 MiB")
-        let mode = item(menu, "宽松阈值（4 / 8 GiB）", #selector(toggleRelaxed)); mode.state = relaxed ? .on : .off
-        let protection = item(menu, "自动退出过大 SceneKit 缩略图（≥4 GiB）", #selector(toggleSceneKitProtection))
-        protection.state = autoExitSceneKit ? .on : .off
+        _ = item(menu, String(format: "内存足迹告警 %.2f / %.2f GiB · 60 秒增长 512 MiB", detector.warn, detector.critical))
+        _ = item(menu, String(format: "三维预览虚拟空间增长提醒 ≥ %.2f GiB", thresholds.virtualGrowth))
+        let swapDelta = systemDetector.swapGrowth.map { String(format: "%+.2f GiB", $0) } ?? "不可用"
+        _ = item(menu, "Swap \(gibText(systemReading.swapBytes)) · 约 60 秒净增 \(swapDelta) · 压力\(systemReading.pressureText)")
+        let mode = item(menu, "宽松告警阈值（自适应值 ×2）", #selector(toggleRelaxed)); mode.state = relaxed ? .on : .off
+        let protection = item(menu, String(format: "自动退出过大三维预览组件（≥%.2f GiB）", thresholds.limit), #selector(togglePreviewProtection))
+        protection.state = autoExitPreview ? .on : .off
         _ = item(menu, paused ? "恢复监控" : "暂停监控", #selector(togglePause))
         menu.addItem(.separator())
         _ = item(menu, "发送测试通知", #selector(testNotification))
@@ -356,12 +518,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    func applyThresholds() { detector.warn = relaxed ? 4 : 2; detector.critical = relaxed ? 8 : 4 }
-    @objc func toggleSceneKitProtection() {
-        autoExitSceneKit.toggle()
-        UserDefaults.standard.set(autoExitSceneKit, forKey: "autoExitSceneKit")
-        logEvent("sceneKitAutoExit=\(autoExitSceneKit) thresholdGiB=4")
-        if autoExitSceneKit { tick() }
+    func applyThresholds() {
+        detector.warn = thresholds.limit / 2 * (relaxed ? 2 : 1)
+        detector.critical = thresholds.limit * (relaxed ? 2 : 1)
+    }
+    @objc func togglePreviewProtection() {
+        autoExitPreview.toggle()
+        UserDefaults.standard.set(autoExitPreview, forKey: "autoExitPreview")
+        logEvent("previewAutoExit=\(autoExitPreview) thresholdGiB=\(thresholds.limit)")
+        if autoExitPreview { tick() }
     }
     @objc func toggleRelaxed() {
         relaxed.toggle(); UserDefaults.standard.set(relaxed, forKey: "relaxed")
@@ -369,6 +534,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
     @objc func togglePause() {
         paused.toggle(); detector.tracks.removeAll()
+        samplingEpoch += 1
+        virtualDetector.reset(); systemDetector = SystemDetector()
         setStatusIcon(problem: false)
         if paused { status.button?.toolTip = "内存监控已暂停，点击菜单恢复。" }
         logEvent(paused ? "paused" : "resumed"); if !paused { tick() }
@@ -409,9 +576,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 }
 
 func protectionSelfTest() {
-    func target(_ bytes: UInt64 = SceneKitProtection.limit, birth: UInt64 = 1) -> Reading {
-        Reading(pid: 42, birth: birth, name: SceneKitProtection.name, bytes: bytes,
-                executablePath: SceneKitProtection.path)
+    let limit: UInt64 = 4 * (1 << 30)
+    func target(_ bytes: UInt64 = 4 * (1 << 30), birth: UInt64 = 1) -> Reading {
+        Reading(pid: 42, birth: birth, name: PreviewProtection.name, bytes: bytes,
+                executablePath: PreviewProtection.path)
     }
     let candidate = target()
     var signals = 0
@@ -419,45 +587,60 @@ func protectionSelfTest() {
         precondition(pid == 42 && value == SIGKILL); signals += 1; return 0
     }
     let probe: (Int32) -> CheckedProcess? = { _ in CheckedProcess(reading: candidate, owner: getuid()) }
-    let guardrail = SceneKitProtection()
-    precondition(guardrail.enforce([target(SceneKitProtection.limit - 1)], now: 0, enabled: true, probe: probe, signal: signal).isEmpty)
+    let guardrail = PreviewProtection(limit: limit)
+    precondition(guardrail.enforce([target(4 * (1 << 30) - 1)], now: 0, enabled: true, probe: probe, signal: signal).isEmpty)
     precondition(guardrail.enforce([candidate], now: 0, enabled: false, probe: probe, signal: signal).isEmpty)
     precondition(signals == 0)
     precondition(guardrail.enforce([candidate], now: 0, enabled: true, probe: probe, signal: signal).count == 1)
     precondition(signals == 1)
     precondition(guardrail.enforce([candidate], now: 5, enabled: true, probe: probe, signal: signal).isEmpty)
+    precondition(guardrail.enforce([], now: 10, enabled: true, probe: probe, signal: signal).isEmpty)
+    precondition(guardrail.enforce([candidate], now: 15, enabled: true, probe: probe, signal: signal).isEmpty)
     precondition(guardrail.enforce([candidate], now: 60, enabled: true, probe: probe, signal: signal).count == 1)
     precondition(signals == 2)
 
-    let wrongPath = Reading(pid: 42, birth: 1, name: SceneKitProtection.name,
-                            bytes: SceneKitProtection.limit, executablePath: "/tmp/SceneKitQLThumbnailExtension")
+    let wrongPath = Reading(pid: 42, birth: 1, name: PreviewProtection.name,
+                            bytes: 4 * (1 << 30), executablePath: "/tmp/SceneKitQLThumbnailExtension")
     let preview = Reading(pid: 42, birth: 1, name: "SceneKitQLPreviewExtension",
-                          bytes: 16 * (1 << 30), executablePath: SceneKitProtection.path)
+                          bytes: 16 * (1 << 30), executablePath: PreviewProtection.path)
     let other = Reading(pid: 42, birth: 1, name: "WeChat", bytes: 16 * (1 << 30))
     for item in [wrongPath, preview, other] {
-        precondition(SceneKitProtection().enforce([item], now: 0, enabled: true, probe: probe, signal: signal).isEmpty)
+        precondition(PreviewProtection(limit: limit).enforce([item], now: 0, enabled: true, probe: probe, signal: signal).isEmpty)
     }
-    let changedPID = Reading(pid: 43, birth: 1, name: SceneKitProtection.name,
-                            bytes: SceneKitProtection.limit, executablePath: SceneKitProtection.path)
+    let changedPID = Reading(pid: 43, birth: 1, name: PreviewProtection.name,
+                            bytes: 4 * (1 << 30), executablePath: PreviewProtection.path)
     let checks: [CheckedProcess?] = [nil,
         CheckedProcess(reading: target(birth: 2), owner: getuid()),
-        CheckedProcess(reading: target(SceneKitProtection.limit - 1), owner: getuid()),
+        CheckedProcess(reading: target(4 * (1 << 30) - 1), owner: getuid()),
         CheckedProcess(reading: candidate, owner: getuid() + 1),
         CheckedProcess(reading: wrongPath, owner: getuid()),
         CheckedProcess(reading: changedPID, owner: getuid())]
     for check in checks {
-        precondition(SceneKitProtection().enforce([candidate], now: 0, enabled: true,
+        precondition(PreviewProtection(limit: limit).enforce([candidate], now: 0, enabled: true,
                      probe: { _ in check }, signal: signal).isEmpty)
     }
     precondition(signals == 2)
 
-    let failing = SceneKitProtection()
+    let failing = PreviewProtection(limit: limit)
     let denied: (Int32, Int32) -> Int32 = { _, _ in errno = EPERM; return -1 }
     precondition(failing.enforce([candidate], now: 0, enabled: true, probe: probe, signal: denied).first?.error == EPERM)
     precondition(failing.enforce([candidate], now: 5, enabled: true, probe: probe, signal: signal).isEmpty)
     let restarted = target(birth: 2)
     precondition(failing.enforce([restarted], now: 5, enabled: true,
                  probe: { _ in CheckedProcess(reading: restarted, owner: getuid()) }, signal: signal).count == 1)
+
+    // Every allowed component is gated by footprint, never by VSZ.
+    for (name, path) in PreviewProtection.paths {
+        let item = Reading(pid: 42, birth: 1, name: name, bytes: limit,
+                           executablePath: path, virtualBytes: UInt64(600 * GiB))
+        let result = PreviewProtection(limit: limit).enforce([item], now: 0, enabled: true,
+            probe: { _ in CheckedProcess(reading: item, owner: getuid()) }, signal: signal)
+        precondition(result.count == 1 && result[0].threshold == limit)
+        let low = Reading(pid: item.pid, birth: item.birth, name: item.name,
+            bytes: limit - 1, executablePath: item.executablePath, virtualBytes: item.virtualBytes)
+        precondition(PreviewProtection(limit: limit).enforce([low], now: 0, enabled: true,
+            probe: { _ in CheckedProcess(reading: low, owner: getuid()) }, signal: signal).isEmpty)
+    }
 
     // Real SIGKILL delivery to a disposable child only. Footprint and target identity
     // are injected fixtures; no large allocation or actual SceneKit process is used.
@@ -466,10 +649,10 @@ func protectionSelfTest() {
     defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
     let identity = checkedProcess(child.processIdentifier)!
     let fixture = Reading(pid: child.processIdentifier, birth: identity.reading.birth,
-                          name: SceneKitProtection.name, bytes: SceneKitProtection.limit,
-                          executablePath: SceneKitProtection.path)
+                          name: PreviewProtection.name, bytes: 4 * (1 << 30),
+                          executablePath: PreviewProtection.path)
     precondition(!processHasExited(fixture))
-    let result = SceneKitProtection().enforce([fixture], now: 0, enabled: true,
+    let result = PreviewProtection(limit: limit).enforce([fixture], now: 0, enabled: true,
         probe: { pid in
             guard let current = checkedProcess(pid), current.reading.birth == identity.reading.birth else { return nil }
             return CheckedProcess(reading: fixture, owner: current.owner)
@@ -478,7 +661,68 @@ func protectionSelfTest() {
     child.waitUntilExit()
     precondition(child.terminationReason == .uncaughtSignal && child.terminationStatus == SIGKILL)
     precondition(processHasExited(fixture))
-    print("PASS: SceneKit 4 GiB boundary, identity/owner recheck, disabled state, cooldown, restart, failure, real child SIGKILL and exit confirmation")
+    print("PASS: preview footprint boundary, identity/owner recheck, disabled state, cooldown, restart, failure, real child SIGKILL and exit confirmation")
+}
+
+func adaptiveSelfTest() {
+    for (ram, limit, virtual) in [(8.0, 4.0, 8.0), (16, 4, 8), (64, 5.548387096774194, 14.967741935483872),
+                                (128, 7.612903225806452, 24.258064516129032),
+                                (256, 11.741935483870968, 42.83870967741935), (512, 20, 80), (1024, 20, 80)] {
+        let policy = Thresholds(ramGiB: ram)
+        precondition(abs(policy.limit - limit) < 0.000001)
+        precondition(abs(policy.virtualGrowth - virtual) < 0.000001)
+    }
+    let suite = "memory-watch-self-test.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(false, forKey: "autoExitSceneKit")
+    precondition(!migratedProtectionPreference(defaults))
+    defaults.set(true, forKey: "autoExitSceneKit")
+    precondition(!migratedProtectionPreference(defaults)) // New preference wins after migration.
+    defaults.removePersistentDomain(forName: suite)
+    precondition(migratedProtectionPreference(defaults))
+
+    func preview(_ vsz: Double?, birth: UInt64 = 1) -> Reading {
+        Reading(pid: 42, birth: birth, name: "HydraRenderingService", bytes: UInt64(0.2 * GiB),
+                executablePath: PreviewProtection.paths["HydraRenderingService"]!,
+                virtualBytes: vsz.map { UInt64($0 * GiB) })
+    }
+    let virtual = VirtualDetector(threshold: 8)
+    precondition(virtual.update([preview(nil)], now: 0).isEmpty)
+    precondition(virtual.update([preview(492)], now: 5).isEmpty)
+    precondition(virtual.update([preview(499.99)], now: 10).isEmpty)
+    precondition(virtual.update([preview(500)], now: 15).count == 1)
+    precondition(virtual.hasProblem)
+    precondition(virtual.update([preview(501)], now: 20).isEmpty)
+    precondition(virtual.update([preview(nil)], now: 25).isEmpty)
+    precondition(virtual.update([preview(501)], now: 315).count == 1)
+    precondition(virtual.update([preview(700, birth: 2)], now: 320).isEmpty)
+    virtual.reset() // Pause/resume discards the old baseline.
+    precondition(virtual.update([preview(800, birth: 2)], now: 325).isEmpty)
+    _ = virtual.update([], now: 330); precondition(virtual.tracks.isEmpty)
+    var fake = preview(1000); fake.executablePath = "/tmp/HydraRenderingService"
+    precondition(virtual.update([fake], now: 335).isEmpty && virtual.tracks.isEmpty)
+
+    let system = SystemDetector()
+    precondition(system.update(SystemReading(swapBytes: UInt64(20 * GiB), pressure: 1), now: 0) == nil)
+    precondition(system.update(SystemReading(swapBytes: UInt64(20.5 * GiB), pressure: 2), now: 5) == nil)
+    precondition(system.update(SystemReading(swapBytes: UInt64(21 * GiB), pressure: 2), now: 10) != nil)
+    precondition(system.update(SystemReading(swapBytes: UInt64(21 * GiB), pressure: 4), now: 15) != nil) // Escalation.
+    precondition(system.update(SystemReading(swapBytes: UInt64(21 * GiB), pressure: 4), now: 20) == nil)
+    precondition(system.update(SystemReading(), now: 25) == nil && !system.hasProblem && system.swapGrowth == nil)
+    let gap = SystemDetector()
+    _ = gap.update(SystemReading(swapBytes: 0, pressure: 1), now: 0)
+    precondition(gap.update(SystemReading(swapBytes: UInt64(10 * GiB), pressure: 1), now: 100) == nil)
+    let swapOnly = SystemDetector()
+    _ = swapOnly.update(SystemReading(swapBytes: 0, pressure: 1), now: 0)
+    precondition(swapOnly.update(SystemReading(swapBytes: UInt64(GiB), pressure: 1), now: 5) == nil)
+    precondition(swapOnly.update(SystemReading(swapBytes: UInt64(GiB), pressure: 1), now: 60) != nil)
+    let jitter = SystemDetector()
+    for i in 0...12 {
+        _ = jitter.update(SystemReading(swapBytes: UInt64(Double(i) / 12 * GiB), pressure: 1), now: Double(i) * 5.01)
+    }
+    precondition(jitter.hasProblem)
+    print("PASS: independent linear RAM/VSZ interpolation, preference migration, virtual baseline/boundary/cooldown/PID reuse/pause, missing metrics, swap/pressure/escalation/window jitter")
 }
 
 func selfTest() {
@@ -512,6 +756,7 @@ func selfTest() {
     precondition(transient.update([r(2.1)], now: 10).isEmpty)
     print("PASS: threshold, escalation, cooldown, PID reuse, exit, growth, stale window, noise, transient spike")
     protectionSelfTest()
+    adaptiveSelfTest()
 }
 
 if CommandLine.arguments.contains("--self-test") {
@@ -545,8 +790,16 @@ if CommandLine.arguments.contains("--self-test") {
     dispatchMain()
 } else if CommandLine.arguments.contains("--snapshot") {
     let result = snapshot()
-    print("readable=\(result.items.count) unavailable=\(result.skipped)")
-    for item in result.items.prefix(15) { print(String(format: "%d %.3f GiB %@", item.pid, item.gib, item.name)) }
+    let policy = Thresholds()
+    let system = systemSnapshot()
+    print("version=\(appVersion) readable=\(result.items.count) unavailable=\(result.skipped)")
+    print(String(format: "ramGiB=%.2f warnGiB=%.2f criticalGiB=%.2f autoExitGiB=%.2f virtualGrowthGiB=%.2f", policy.ramGiB, policy.limit / 2, policy.limit, policy.limit, policy.virtualGrowth))
+    print("swap=\(gibText(system.swapBytes)) pressure=\(system.pressureText)")
+    let top = Array(result.items.prefix(15))
+    let keys = Set(top.map { $0.key })
+    for item in top + result.items.filter({ PreviewProtection.isPreview($0) && !keys.contains($0.key) }) {
+        print("\(item.pid) \(item.name) footprint=\(gibText(item.bytes)) rss=\(gibText(item.residentBytes)) vsz=\(gibText(item.virtualBytes)) previewTarget=\(PreviewProtection.isPreview(item))")
+    }
 } else {
     let application = NSApplication.shared
     let delegate = AppDelegate()
